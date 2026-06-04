@@ -562,3 +562,45 @@ producing knowledge, not replicating a guide.
 Never leave an instance running between sessions. Terminate (not stop) after each.
 A forgotten idle instance billed one user $583 (verified). Confirm it's gone from
 the dashboard before walking away.
+
+======================================================================
+# SESSION 1 VALIDATION FINDINGS (verified live on 1x A100, ~$5)
+======================================================================
+
+Validated the full multi-worker + KV-router mechanism on 1 A100 by running 2
+workers on the SAME GPU (Qwen3-0.6B, gpu-memory-utilization 0.3 each). Found and
+fixed 4 real issues — all of which would have cost more at 8-GPU scale:
+
+1. NATS + etcd ARE REQUIRED (corrects the earlier "file discovery, no NATS"
+   assumption). They are ALREADY in the container at /usr/bin/nats-server and
+   /usr/local/bin/etcd/etcd. Start them FIRST, before frontend/workers:
+       nats-server -js > nats.log 2>&1 &
+       /usr/local/bin/etcd/etcd --data-dir /tmp/etcd.data \
+         --listen-client-urls http://0.0.0.0:2379 \
+         --advertise-client-urls http://0.0.0.0:2379 > etcd.log 2>&1 &
+
+2. Container 1.2.0 uses: discovery = etcd(localhost:2379), request plane = TCP
+   (NOT NATS for the request plane). KV events still go over ZMQ as configured.
+
+3. Workers must start SEQUENTIALLY, not in parallel: two workers racing on
+   kv-cache allocation -> "ValueError: No available memory for the cache blocks".
+   Start worker A, WAIT until it registers (grep "Registered endpoint
+   'dynamo.backend.generate'" in its log), THEN start worker B. On Session 2
+   (8 separate GPUs) the VRAM race is absent, but sequential start stays the
+   safe default.
+
+4. Between frontend restarts, port 8000 is not released instantly: a quick
+   restart hits "Address already in use (os error 98)". Use pkill -9 + sleep 5
+   before relaunching the frontend.
+
+ENVIRONMENT NOTES:
+- Docker needs sudo on the Lambda image (ubuntu user not in docker group).
+- Container image nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0 is PUBLIC (no NGC login).
+- vLLM in container = 0.20.1. dynamo.frontend / dynamo.vllm import OK. GPU visible.
+- Run container detached (sleep infinity) + docker exec for control (clean over SSH 2-hop).
+- SSH: key is ~/.ssh/runpod_optimdev (reused for Lambda); alias "lambda-ab" in ~/.ssh/config.
+
+STILL TO VERIFY (Session 2 start, low risk): inferscope built with --features
+gpu-nvidia inside the container + a --sample-only run against a worker PID with
+real NVML. eBPF in-container likely blocked (container not --privileged) ->
+documented fallback: rely on inferscope NVML sampling.
