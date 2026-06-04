@@ -51,13 +51,11 @@ Notes:
 
 ## Phase 3: Smoke test (single worker, minimal cost)
 
-Confirm Dynamo serves before the A/B:
-       cd /work
-       python -m dynamo.frontend > fe.log 2>&1 &
-       CUDA_VISIBLE_DEVICES=0 python3 -m dynamo.vllm --model Qwen/Qwen3-8B --enforce-eager --max-model-len 4096 > w0.log 2>&1 &
-       (wait for ready, then:)
-       curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"Qwen/Qwen3-8B","messages":[{"role":"user","content":"hi"}],"max_tokens":16}'
-       (expect valid completion; then kill these before the A/B)
+Confirm Dynamo serves before the A/B with a single worker, then kill it.
+RATIONALE ONLY — for the exact, reconciled smoke-test commands (block-size 64,
+max-model-len 16384) see >>> CONSOLIDATED EXECUTION / Step 1 <<< at the end of
+this document. The snippet that used to live here used max-model-len 4096, which
+the trace-distribution decision later superseded; do not run it.
 
 ----------------------------------------------------------------------
 
@@ -120,9 +118,10 @@ DECISION (to fix before running): use a trimmed slice for cost control.
 The full trace can be long; we will cap to the first K requests (e.g. 1000)
 so each A/B run is minutes, not hours. Same slice for both arms (identical input).
 
-Prep step (trim + verify), prepared cold here, run on box:
-       head -1000 mooncake_trace.jsonl > mooncake_1k.jsonl
-       wc -l mooncake_1k.jsonl   (expect 1000)
+Prep step — RATIONALE ONLY. The naive `head -1000` on the RAW trace is WRONG:
+~10% of raw requests exceed 16384 tokens and would be rejected. The correct order
+is FILTER (input<=16384) THEN slice. For the exact commands see
+>>> CONSOLIDATED EXECUTION / Step 2 <<< at the end of this document.
 
 ----------------------------------------------------------------------
 
@@ -139,13 +138,14 @@ Per-arm procedure (do OFF first, then ON, or interleave — document order):
 3. THREE measured runs, saved to separate artifact dirs.
 4. Tear down the arm cleanly (kill 0 / trap), then start the other arm.
 
-AIPerf command (mooncake trace replay), per measured run r=1..3:
-       aiperf profile --model Qwen/Qwen3-8B --tokenizer Qwen/Qwen3-8B --endpoint-type chat --streaming -u http://localhost:8000 --input-file mooncake_1k.jsonl --custom-dataset-type mooncake_trace --artifact-dir /work/results/<arm>/run_${r} --random-seed $((100+r))
-
-Key flags rationale:
-- --input-file + --custom-dataset-type mooncake_trace: replay the real trace (not synthetic).
-- --random-seed varied per run: independent samples for averaging.
-- same command for both arms: only the running deployment differs.
+AIPerf command — RATIONALE ONLY. The obsolete snippet here lacked
+--fixed-schedule-auto-offset and --isl-block-size, and varied --random-seed as if
+the runs were independent statistical samples (wrong: under fixed-schedule the
+trace replay is deterministic, so 3 runs measure SYSTEM variance for the same
+input). For the exact, reconciled AIPerf invocation see
+>>> CONSOLIDATED EXECUTION / Step 4 <<< at the end of this document.
+Key points retained: replay the REAL trace (not synthetic); same command both
+arms (only the deployment differs).
 
 Metrics AIPerf reports (the A/B comparison surface):
 - TTFT (mean, p50, p95, p99)   <- KV routing should improve this most
