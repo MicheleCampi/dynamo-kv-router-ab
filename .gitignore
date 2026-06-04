@@ -1,0 +1,9 @@
+# Upstream dataset — re-downloadable from the URL in the RUNBOOK, not ours to redistribute
+mooncake_sample.jsonl
+mooncake_trace.jsonl
+mooncake_filtered.jsonl
+mooncake_*.jsonl
+
+# Experiment outputs (produced on the GPU box)
+results/
+*.log
