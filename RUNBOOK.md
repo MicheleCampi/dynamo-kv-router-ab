@@ -416,3 +416,102 @@ DECISION RULE:
 COST DISCIPLINE: the eBPF feasibility check is a few minutes in the smoke phase
 on a CHEAP single-GPU window, NOT during the paid multi-GPU A/B run. Decide
 go/no-go before the expensive run so the A/B itself is never blocked by it.
+
+======================================================================
+# CONSOLIDATED EXECUTION (single source of truth)
+======================================================================
+
+The phases above are the reasoning and context. THIS section is the exact
+sequence to run during the paid GPU session, with all parameters reconciled
+to the decisions made later in the document (trace filter, fixed-schedule,
+sample-only). When executing, follow THIS — not the per-phase snippets above,
+which predate some decisions and are kept only as rationale.
+
+## Fixed parameters (reconciled)
+- MODEL = Qwen/Qwen3-8B
+- N_WORKERS = 2 (or 4 if the instance has 4 GPUs) — SAME in both arms
+- vLLM worker: --block-size 64, --max-model-len 16384, --enforce-eager
+- AIPerf client: --isl-block-size 512 (mooncake default), --fixed-schedule-auto-offset
+- Trace: filtered to input<=16384 THEN sliced. NOT head -1000 on the raw trace.
+- inferscope: --sample-only, --gpu, --sample-period-ms 100
+- Discovery: file backend; KV events: zmq. No etcd/NATS.
+
+## Step 0 — instance up, container running (Phases 1-2)
+Provision N-GPU instance; verify nvidia-smi; pull and run the container
+(--gpus all --network host --shm-size 16g -v ~/dynamo-ab:/work). For the eBPF
+option also add --privileged -v /sys/kernel/btf:/sys/kernel/btf:ro (Phase 7c).
+
+## Step 1 — smoke test (cheap, 1 worker)
+       cd /work
+       python -m dynamo.frontend > fe.log 2>&1 &
+       CUDA_VISIBLE_DEVICES=0 python3 -m dynamo.vllm --model Qwen/Qwen3-8B \
+         --block-size 64 --max-model-len 16384 --enforce-eager > w0.log 2>&1 &
+       # wait for ready, then:
+       curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
+         -d '{"model":"Qwen/Qwen3-8B","messages":[{"role":"user","content":"hi"}],"max_tokens":16}'
+       # expect a valid completion. ALSO confirm the OFF arm flag is accepted:
+       # (round-robin is a validated choice — verified in router_args.py)
+       # kill the smoke processes before the A/B.
+
+## Step 2 — prepare the dataset (filter THEN slice)
+       cd /work
+       curl -sL -o mooncake_trace.jsonl \
+         https://raw.githubusercontent.com/kvcache-ai/Mooncake/refs/heads/main/FAST25-release/arxiv-trace/mooncake_trace.jsonl
+       python3 -c "import json
+[print(l.strip()) for l in open('mooncake_trace.jsonl')
+ if l.strip() and json.loads(l)['input_length']<=16384]" > mooncake_filtered.jsonl
+       head -1000 mooncake_filtered.jsonl > mooncake_1k.jsonl
+       wc -l mooncake_1k.jsonl   # expect 1000
+
+## Step 3 — per arm (run OFF first, then ON), ARM in {off, on}
+Start the arm with N identical workers; only the frontend router mode differs.
+       export PYTHONHASHSEED=0
+       # frontend:
+       #   OFF: python -m dynamo.frontend --router-mode round-robin > fe.log 2>&1 &
+       #   ON : python -m dynamo.frontend --router-mode kv --router-reset-states > fe.log 2>&1 &
+       # then N workers, i=0..N-1, IDENTICAL in both arms:
+       #   DYN_SYSTEM_PORT=$((8081+i)) CUDA_VISIBLE_DEVICES=$i python3 -m dynamo.vllm \
+       #     --model Qwen/Qwen3-8B --block-size 64 --max-model-len 16384 --enforce-eager \
+       #     --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:'$((20080+i))'","enable_kv_cache_events":true}' &
+       # (use scripts/arm_off.sh / arm_on.sh with N as arg)
+Verify ALL N workers registered before benchmarking:
+       pgrep -af dynamo.vllm | cat   # expect N processes
+       curl -s localhost:8000/v1/models   # model present
+
+## Step 4 — warm-up (unmeasured), then 3 measured runs
+WARM-UP (populate caches; result discarded):
+       aiperf profile --model Qwen/Qwen3-8B --tokenizer Qwen/Qwen3-8B \
+         --endpoint-type chat --streaming -u http://localhost:8000 \
+         --input-file mooncake_1k.jsonl --custom-dataset-type mooncake_trace \
+         --isl-block-size 512 --fixed-schedule-auto-offset \
+         --artifact-dir /work/results/${ARM}/warmup
+
+For r in 1 2 3 (measured): launch AIPerf and inferscope TOGETHER.
+       # inferscope (background, brackets the run):
+       PID=$(pgrep -f dynamo.vllm | head -1)
+       ./inferscope --sample-only --pid $PID --duration-secs <run_secs+30> \
+         --gpu --sample-period-ms 100 --json > /work/results/${ARM}/inferscope_run${r}.json &
+       # AIPerf (foreground):
+       aiperf profile --model Qwen/Qwen3-8B --tokenizer Qwen/Qwen3-8B \
+         --endpoint-type chat --streaming -u http://localhost:8000 \
+         --input-file mooncake_1k.jsonl --custom-dataset-type mooncake_trace \
+         --isl-block-size 512 --fixed-schedule-auto-offset \
+         --artifact-dir /work/results/${ARM}/run_${r}
+
+WHY 3 runs (corrected rationale): under fixed-schedule the trace replay is
+deterministic (same arrival pattern every run), so the 3 runs measure SYSTEM
+variance (scheduler, cache warmth, jitter) for the SAME input — not different
+statistical samples. Report mean +/- stddev across the 3. Do NOT vary a seed to
+manufacture "independent samples": the trace timing is the controlled input.
+
+## Step 5 — teardown the arm, repeat for the other arm
+       # stop frontend + workers (kill the process group / Ctrl-C the script)
+       # confirm GPUs idle (nvidia-smi) before starting the next arm.
+
+## Step 6 — collect and terminate (Phase 8)
+Pull /work/results off the box; record GPU minutes + cost; TERMINATE the instance.
+
+## Step 7 — analysis + article (Phase 9, on VM, zero cost)
+Average 3 runs/arm; OFF->ON delta with stddev; three-way table
+(AIC predicted vs AIPerf measured vs inferscope resource truth); per-GPU
+utilization distribution (OFF even vs ON skewed); write the article.
