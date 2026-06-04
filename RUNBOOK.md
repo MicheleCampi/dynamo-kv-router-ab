@@ -515,3 +515,50 @@ Pull /work/results off the box; record GPU minutes + cost; TERMINATE the instanc
 Average 3 runs/arm; OFF->ON delta with stddev; three-way table
 (AIC predicted vs AIPerf measured vs inferscope resource truth); per-GPU
 utilization distribution (OFF even vs ON skewed); write the article.
+
+======================================================================
+# LAMBDA ACTION PLAN — two sessions (validation, then real runs)
+======================================================================
+
+Budget is NOT the binding constraint; POSITIONING (top-5%, inference-serving
+observability) is. Spend what the rigor needs. Same GPU type both sessions:
+A100 PCIe 40GB (do NOT validate on a cheaper/different card — VRAM mismatch
+would validate a phantom).
+
+## SESSION 1 — validation (2x A100 PCIe 40GB, ~$4/hr, ~1h, ~$5)
+Goal: shake out the MULTI-WORKER mechanism cheaply (worker registration, ZMQ
+port wiring, KV-event flow, router consuming events, arm parity). 1 GPU would
+NOT exercise routing; 2 is the minimum that does.
+- Step 0-2 (container, smoke, dataset) per CONSOLIDATED EXECUTION.
+- Run the FULL A/B small: N=2, both arms, ONE run each (not 3), small trace slice.
+- Confirm: all workers register, both arms serve, inferscope --sample-only emits
+  a ResourceReport with a per_device array, eBPF feasibility (Phase 7c) known.
+- Fix any setup issue HERE, at $4/hr. Then TERMINATE. Do not proceed dirty.
+
+## SESSION 2 — real runs + SCALING CURVE (A100 PCIe 40GB, ~$1.99/GPU/hr)
+Goal: the publishable result. Setup is now rodato from Session 1, so this is
+runs-only, fast.
+The distinctive top-5% angle: not a single 8-worker point (what the NVIDIA guide
+shows) but the SCALING CURVE — how the KV-routing benefit grows with worker count.
+Measure at N = 2, 4, 8 workers. Each N: both arms (round-robin/kv), 3 runs each,
+inferscope sampling throughout.
+- N=2: 2 GPUs ~$4/hr
+- N=4: 4 GPUs ~$8/hr
+- N=8: 8 GPUs ~$16/hr
+Run smallest-to-largest (2 -> 4 -> 8) so any late surprise is caught cheap.
+Rough time: ~2-3h active; cost ~$30-45 across the scaling sweep. Acceptable.
+- Per N, per arm: warm-up (unmeasured) + 3 measured runs (AIPerf + inferscope),
+  following CONSOLIDATED EXECUTION Step 3-4. Tag results/N{2,4,8}/{off,on}/...
+- After all N: pull results off the box, record cost, TERMINATE immediately.
+
+## DELIVERABLE (Session 3, on VM, zero cost)
+The article: KV-routing TTFT/throughput delta AS A FUNCTION of worker count
+(the curve), triangulated with inferscope per-device resource truth (load skew,
+power — which AIConfigurator cannot predict) and AIConfigurator predictions.
+"How the KV-router benefit scales, profiled with a custom observability stack" —
+producing knowledge, not replicating a guide.
+
+## HARD RULE
+Never leave an instance running between sessions. Terminate (not stop) after each.
+A forgotten idle instance billed one user $583 (verified). Confirm it's gone from
+the dashboard before walking away.
