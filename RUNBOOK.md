@@ -427,82 +427,78 @@ to the decisions made later in the document (trace filter, fixed-schedule,
 sample-only). When executing, follow THIS — not the per-phase snippets above,
 which predate some decisions and are kept only as rationale.
 
-## Fixed parameters (reconciled)
-- MODEL = Qwen/Qwen3-8B
-- N_WORKERS = 2 (or 4 if the instance has 4 GPUs) — SAME in both arms
+## Fixed parameters (reconciled + Session-1 validated)
+- MODEL = Qwen/Qwen3-8B  (validation used Qwen3-0.6B; real runs use 8B)
 - vLLM worker: --block-size 64, --max-model-len 16384, --enforce-eager
-- AIPerf client: --isl-block-size 512 (mooncake default), --fixed-schedule-auto-offset
-- Trace: filtered to input<=16384 THEN sliced. NOT head -1000 on the raw trace.
+- AIPerf client: --isl-block-size 512, --fixed-schedule-auto-offset
+- Trace: filtered to input<=16384 THEN sliced.
 - inferscope: --sample-only, --gpu, --sample-period-ms 100
-- Discovery: file backend; KV events: zmq. No etcd/NATS.
+- INFRA (corrected by Session 1): NATS + etcd REQUIRED, started first, inside the
+  container. Discovery = etcd(localhost:2379), request plane = TCP, KV events = ZMQ.
+- All docker commands use sudo. Container run detached + docker exec for control.
 
-## Step 0 — instance up, container running (Phases 1-2)
-Provision N-GPU instance; verify nvidia-smi; pull and run the container
-(--gpus all --network host --shm-size 16g -v ~/dynamo-ab:/work). For the eBPF
-option also add --privileged -v /sys/kernel/btf:/sys/kernel/btf:ro (Phase 7c).
+## SCALING CURVE: one 8x A100 instance covers N=2,4,8 via CUDA_VISIBLE_DEVICES.
+Run N=2 first, then 4, then 8. Each N: both arms (round-robin, kv), 3 runs + inferscope.
 
-## Step 1 — smoke test (cheap, 1 worker)
-       cd /work
-       python -m dynamo.frontend > fe.log 2>&1 &
-       CUDA_VISIBLE_DEVICES=0 python3 -m dynamo.vllm --model Qwen/Qwen3-8B \
-         --block-size 64 --max-model-len 16384 --enforce-eager > w0.log 2>&1 &
-       # wait for ready, then:
-       curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
-         -d '{"model":"Qwen/Qwen3-8B","messages":[{"role":"user","content":"hi"}],"max_tokens":16}'
-       # expect a valid completion. ALSO confirm the OFF arm flag is accepted:
-       # (round-robin is a validated choice — verified in router_args.py)
-       # kill the smoke processes before the A/B.
+## Step 0 — instance + container (once per session)
+On the host (sudo for docker; ubuntu not in docker group):
+       git clone https://github.com/MicheleCampi/dynamo-kv-router-ab.git
+       sudo docker pull nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0
+       sudo docker run -d --name dynamo --gpus all --network host --shm-size 16g \
+         -v $HOME/dynamo-kv-router-ab:/work -w /work \
+         nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0 sleep infinity
+       sudo docker exec dynamo nvidia-smi -L   # confirm 8 GPUs
 
-## Step 2 — prepare the dataset (filter THEN slice)
-       cd /work
-       curl -sL -o mooncake_trace.jsonl \
-         https://raw.githubusercontent.com/kvcache-ai/Mooncake/refs/heads/main/FAST25-release/arxiv-trace/mooncake_trace.jsonl
-       python3 -c "import json
-[print(l.strip()) for l in open('mooncake_trace.jsonl')
- if l.strip() and json.loads(l)['input_length']<=16384]" > mooncake_filtered.jsonl
-       head -1000 mooncake_filtered.jsonl > mooncake_1k.jsonl
-       wc -l mooncake_1k.jsonl   # expect 1000
+## Step 1 — start NATS + etcd FIRST (inside container), once per session
+       sudo docker exec -d dynamo bash -c 'nats-server -js > /work/nats.log 2>&1'
+       sudo docker exec -d dynamo bash -c '/usr/local/bin/etcd/etcd --data-dir /tmp/etcd.data \
+         --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://0.0.0.0:2379 > /work/etcd.log 2>&1'
+       sleep 5
+       sudo docker exec dynamo bash -c 'pgrep -a nats-server; pgrep -a etcd'   # both alive
 
-## Step 3 — per arm (run OFF first, then ON), ARM in {off, on}
-Start the arm with N identical workers; only the frontend router mode differs.
-       export PYTHONHASHSEED=0
-       # frontend:
-       #   OFF: python -m dynamo.frontend --router-mode round-robin > fe.log 2>&1 &
-       #   ON : python -m dynamo.frontend --router-mode kv --router-reset-states > fe.log 2>&1 &
-       # then N workers, i=0..N-1, IDENTICAL in both arms:
-       #   DYN_SYSTEM_PORT=$((8081+i)) CUDA_VISIBLE_DEVICES=$i python3 -m dynamo.vllm \
-       #     --model Qwen/Qwen3-8B --block-size 64 --max-model-len 16384 --enforce-eager \
-       #     --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:'$((20080+i))'","enable_kv_cache_events":true}' &
-       # (use scripts/arm_off.sh / arm_on.sh with N as arg)
-Verify ALL N workers registered before benchmarking:
-       pgrep -af dynamo.vllm | cat   # expect N processes
-       curl -s localhost:8000/v1/models   # model present
+## Step 2 — dataset (filter THEN slice), once per session
+       sudo docker exec dynamo bash -c 'cd /work && curl -sL -o mooncake_trace.jsonl \
+         https://raw.githubusercontent.com/kvcache-ai/Mooncake/refs/heads/main/FAST25-release/arxiv-trace/mooncake_trace.jsonl'
+       sudo docker exec dynamo bash -c "cd /work && python3 -c \"import json
+[print(l.strip()) for l in open('mooncake_trace.jsonl') if l.strip() and json.loads(l)['input_length']<=16384]\" > /work/mooncake_filtered.jsonl"
+       sudo docker exec dynamo bash -c 'cd /work && head -1000 mooncake_filtered.jsonl > mooncake_1k.jsonl && wc -l mooncake_1k.jsonl'
 
-## Step 4 — warm-up (unmeasured), then 3 measured runs
-WARM-UP (populate caches; result discarded):
-       aiperf profile --model Qwen/Qwen3-8B --tokenizer Qwen/Qwen3-8B \
-         --endpoint-type chat --streaming -u http://localhost:8000 \
-         --input-file mooncake_1k.jsonl --custom-dataset-type mooncake_trace \
-         --isl-block-size 512 --fixed-schedule-auto-offset \
-         --artifact-dir /work/results/${ARM}/warmup
+## Step 3 — per (N, ARM): start workers SEQUENTIALLY, then frontend
+For N in 2,4,8; for ARM in off,on. Worker i uses GPU i (real multi-GPU: each
+worker its own GPU, no VRAM race — but still start sequentially as the safe default).
+Start worker i, WAIT until it registers, THEN start worker i+1:
+       for i in $(seq 0 $((N-1))); do
+         sudo docker exec -d dynamo bash -c "DYN_SYSTEM_PORT=$((8081+i)) CUDA_VISIBLE_DEVICES=$i \
+           python3 -m dynamo.vllm --model Qwen/Qwen3-8B --block-size 64 --max-model-len 16384 \
+           --enforce-eager --kv-events-config '{\"publisher\":\"zmq\",\"topic\":\"kv-events\",\"endpoint\":\"tcp://*:$((20080+i))\",\"enable_kv_cache_events\":true}' > /work/w${i}.log 2>&1"
+         # poll until: grep -c "Registered endpoint 'dynamo.backend.generate'" /work/w${i}.log  >= 1
+       done
+Then the frontend (router mode is the ONLY A/B difference). Between arms, ensure
+port 8000 is free: pkill -9 -f dynamo.frontend; sleep 5.
+       OFF: sudo docker exec -d dynamo bash -c 'PYTHONHASHSEED=0 python3 -m dynamo.frontend --router-mode round-robin > /work/fe.log 2>&1'
+       ON : sudo docker exec -d dynamo bash -c 'PYTHONHASHSEED=0 python3 -m dynamo.frontend --router-mode kv --router-reset-states > /work/fe.log 2>&1'
+Verify before benchmarking:
+       sudo docker exec dynamo bash -c 'curl -s localhost:8000/v1/models'   # model present
+       sudo docker exec dynamo bash -c 'pgrep -fc dynamo.vllm'              # >= N (2 procs/worker)
 
-For r in 1 2 3 (measured): launch AIPerf and inferscope TOGETHER.
-       # inferscope (background, brackets the run):
-       PID=$(pgrep -f dynamo.vllm | head -1)
-       ./inferscope --sample-only --pid $PID --duration-secs <run_secs+30> \
-         --gpu --sample-period-ms 100 --json > /work/results/${ARM}/inferscope_run${r}.json &
+## Step 4 — warm-up then 3 measured runs (per N, per ARM)
+Tag artifacts results/N${N}/${ARM}/... . Warm-up (discarded), then r=1,2,3:
+       # inferscope brackets each measured run (one sampler covers all GPUs via --gpu):
+       PID=$(sudo docker exec dynamo bash -c 'pgrep -f dynamo.vllm | head -1')
+       sudo docker exec -d dynamo bash -c "/work/inferscope --sample-only --pid $PID \
+         --duration-secs <run+30> --gpu --sample-period-ms 100 --json > /work/results/N${N}/${ARM}/inferscope_run${r}.json"
        # AIPerf (foreground):
-       aiperf profile --model Qwen/Qwen3-8B --tokenizer Qwen/Qwen3-8B \
-         --endpoint-type chat --streaming -u http://localhost:8000 \
+       sudo docker exec dynamo bash -c "cd /work && aiperf profile --model Qwen/Qwen3-8B \
+         --tokenizer Qwen/Qwen3-8B --endpoint-type chat --streaming -u http://localhost:8000 \
          --input-file mooncake_1k.jsonl --custom-dataset-type mooncake_trace \
-         --isl-block-size 512 --fixed-schedule-auto-offset \
-         --artifact-dir /work/results/${ARM}/run_${r}
+         --isl-block-size 512 --fixed-schedule-auto-offset --artifact-dir /work/results/N${N}/${ARM}/run_${r}"
 
-WHY 3 runs (corrected rationale): under fixed-schedule the trace replay is
-deterministic (same arrival pattern every run), so the 3 runs measure SYSTEM
-variance (scheduler, cache warmth, jitter) for the SAME input — not different
-statistical samples. Report mean +/- stddev across the 3. Do NOT vary a seed to
-manufacture "independent samples": the trace timing is the controlled input.
+WHY 3 runs: fixed-schedule replay is deterministic, so 3 runs measure SYSTEM
+variance for the SAME input. Report mean +/- stddev. Do NOT vary a seed.
+
+NOTE: inferscope must be built once on the box with --features gpu-nvidia
+(see Step 4b). eBPF in-container likely blocked (not --privileged) -> rely on
+inferscope NVML sampling (documented fallback).
 
 ## Step 5 — teardown the arm, repeat for the other arm
        # stop frontend + workers (kill the process group / Ctrl-C the script)
