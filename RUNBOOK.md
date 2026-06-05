@@ -500,6 +500,26 @@ NOTE: inferscope must be built once on the box with --features gpu-nvidia
 (see Step 4b). eBPF in-container likely blocked (not --privileged) -> rely on
 inferscope NVML sampling (documented fallback).
 
+## Step 4b — build inferscope on the box (ONCE, before any measured run)
+inferscope needs the gpu-nvidia feature, built where NVML + the GPU live.
+Clone the repo and build inside the container (check for cargo first):
+
+       sudo docker exec dynamo bash -c 'which cargo || echo NO-CARGO'
+
+If cargo IS present in the container:
+       sudo docker exec dynamo bash -c 'cd /work && git clone https://github.com/MicheleCampi/inferscope.git && cd inferscope && cargo build --release --features gpu-nvidia 2>&1 | tail -5'
+       sudo docker exec dynamo bash -c 'cp /work/inferscope/target/release/inferscope /work/inferscope-bin'
+       # Step 4 then calls /work/inferscope-bin (adjust the path in Step 4 accordingly).
+
+If cargo is NOT in the container, install rustup first (MSRV 1.83):
+       sudo docker exec dynamo bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . $HOME/.cargo/env && cd /work && git clone https://github.com/MicheleCampi/inferscope.git && cd inferscope && cargo build --release --features gpu-nvidia 2>&1 | tail -5'
+
+VERIFY the binary works against a live worker (after workers are up):
+       PID=$(sudo docker exec dynamo bash -c 'pgrep -f dynamo.vllm | head -1')
+       sudo docker exec dynamo bash -c "/work/inferscope-bin --sample-only --pid $PID --duration-secs 10 --gpu --sample-period-ms 100 --json" | head -c 400
+       # expect JSON with a per_device array (one entry per visible GPU). This is
+       # the distinctive measurement; confirm it runs with real NVML before the A/B.
+
 ## Step 5 — teardown the arm, repeat for the other arm
        # stop frontend + workers (kill the process group / Ctrl-C the script)
        # confirm GPUs idle (nvidia-smi) before starting the next arm.
