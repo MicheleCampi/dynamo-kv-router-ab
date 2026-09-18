@@ -43,9 +43,10 @@ Per-run failure counts at N=2/on: 103, 149, 177 (10.3% → 14.9% → 17.7%).
    - `--router-mode kv` creates a `KvWorkerMonitor` (`lib/llm/src/discovery/watcher.rs:806`)
      that tracks worker busy-state and feeds it to the PushRouter via `update_free_instances`.
    - The router is built with `fault_detection_enabled=true`
-     (`from_client_with_monitor`, `push_router.rs`).
+     (`from_client_with_monitor`,
+     `lib/runtime/src/pipeline/network/egress/push_router.rs:452`).
    - Under saturation `instance_ids_free()` is empty → the router rejects with 503
-     (`push_router.rs:809-828`).
+     (same file, the `if self.fault_detection_enabled` branch at :810).
    - `--router-mode round-robin` does NOT create the monitor → workers never appear
      "busy" → no rejection → requests queue instead.
    - Divergence is gated solely on `--router-mode`; all other params at defaults.
