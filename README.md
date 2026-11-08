@@ -1,15 +1,24 @@
 # Dynamo KV-Router A/B Experiment
 
-A rigorous A/B benchmark of NVIDIA Dynamo's KV-aware router vs round-robin
+An A/B benchmark of NVIDIA Dynamo's KV-aware router vs round-robin
 routing, on identical multi-worker aggregated deployments, driven by a real
 production trace (Mooncake) and profiled with a custom observability stack
 (inferscope) on top of NVIDIA's own AIPerf methodology.
+
+**Setup:** Qwen3-8B on vLLM 0.20.1, Dynamo container `vllm-runtime:1.2.0`,
+8×A100-SXM4-40GB.
+
+**Result:** the KV router trades completeness for latency near saturation. At
+N = 2 it cuts TTFT p50 from 12125 ms to 2634 ms by rejecting 14.3% of requests
+with HTTP 503; at N = 4 and 8 neither arm fails a request and the KV router's
+TTFT p50 is higher (411 vs 312 ms, 339 vs 197 ms). Full table in `ANALYSIS.md`.
 
 ## What this is
 - **Method**: two deployments differing ONLY in `--router-mode` (round-robin vs kv),
   same worker count, deterministic KV hashing, warm-up + 3 averaged runs.
 - **Workload**: Mooncake arxiv trace (real shared-prefix structure; the case where
-  KV routing matters). Filtered to inputs <= 16384 tokens (89.7% of the trace).
+  KV routing matters). Filtered to inputs <= 16384 tokens
+  (21,167 of 23,608 requests, 89.7% of the trace), then sliced to 1,000.
 - **Measurement**: AIPerf for client-side latency/throughput; inferscope
   `--sample-only` for server-side per-device GPU truth (SM/VRAM/power) that the
   NVIDIA A/B guide does not show.
